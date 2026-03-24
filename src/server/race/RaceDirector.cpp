@@ -281,6 +281,12 @@ RaceDirector::RaceDirector(ServerInstance& serverInstance)
       HandleInviteUser(clientId, message);
     });
 
+  _commandServer.RegisterCommandHandler<protocol::AcCmdCRRequestUser>(
+    [this](ClientId clientId, const auto& message)
+    {
+      HandleRequestUser(clientId, message);
+    });
+
   _commandServer.RegisterCommandHandler<protocol::AcCmdCRKick>(
     [this](ClientId clientId, const auto& message)
     {
@@ -383,6 +389,8 @@ void RaceDirector::Tick()
     spdlog::error("Exception ticking a race scheduler: {}", x.what());
   }
 
+  std::scoped_lock lock(_raceInstancesMutex);
+
   // Process rooms which are loading
   for (auto& [raceUid, raceInstance] : _raceInstances)
   {
@@ -436,7 +444,6 @@ void RaceDirector::Tick()
         raceInstance.raceStartTimePoint)};
 
     // Broadcast the race countdown.
-    std::scoped_lock lock(raceInstance.clientsMutex);
     for (const ClientId& raceClientId : raceInstance.clients)
     {
       _commandServer.QueueCommand<protocol::AcCmdUserRaceCountdown>(
@@ -477,7 +484,6 @@ void RaceDirector::Tick()
       protocol::AcCmdUserRaceFinalNotify notify{};
 
       // Broadcast the race final.
-      std::scoped_lock lock(raceInstance.clientsMutex);
       for (const ClientId& raceClientId : raceInstance.clients)
       {
         bool isParticipant = false;
@@ -608,12 +614,36 @@ void RaceDirector::Tick()
   }
 }
 
+void RaceDirector::NotifyRequestUser(
+    data::Uid characterUid,
+    bool force,
+    std::string characterName,
+    uint32_t roomUid,
+    uint32_t ranchUid) noexcept
+{
+  protocol::AcCmdRCRequestUser notify{};
+  notify.force = force;
+  notify.characterName = characterName;
+  notify.roomUid = roomUid;
+  notify.ranchUid = ranchUid;
+
+  try
+  {
+     const auto targetClientId = GetClientIdByCharacterUid(characterUid);
+     _commandServer.QueueCommand<protocol::AcCmdRCRequestUser>(targetClientId, [notify](){ return notify; });
+  }
+  catch(const std::exception&)
+  {
+    // Dont care if the client is not found, we just won't send the notification
+  }
+}
+
 void RaceDirector::BroadcastChangeRoomOptions(
   const data::Uid& roomUid,
   const protocol::AcCmdCRChangeRoomOptionsNotify notify)
 {
+  std::scoped_lock raceLock(_raceInstancesMutex);
   auto& raceInstance = _raceInstances[roomUid];
-  std::scoped_lock lock(raceInstance.clientsMutex);
   for (const auto raceClientId : raceInstance.clients)
   {
     _commandServer.QueueCommand<decltype(notify)>(
@@ -640,9 +670,11 @@ void RaceDirector::HandleClientDisconnected(ClientId clientId)
   const auto& clientContext = GetClientContext(clientId, false);
   if (clientContext.isAuthenticated)
   {
+    std::unique_lock lock(_raceInstancesMutex);
     const auto raceIter = _raceInstances.find(clientContext.roomUid);
     if (raceIter != _raceInstances.cend())
     {
+      lock.unlock();
       HandleLeaveRoom(clientId);
     }
   }
@@ -712,7 +744,7 @@ RaceDirector::ClientContext& RaceDirector::GetClientContextByCharacterUid(
 }
 
 RaceDirector::RaceInstance& RaceDirector::GetRaceInstance(
-  const RaceDirector::ClientContext clientContext,
+  const ClientContext& clientContext,
   const bool checkRacer)
 {
   // Check if the client has an invalid room UID
@@ -796,10 +828,13 @@ void RaceDirector::HandleEnterRoom(
   clientContext.characterUid = command.characterUid;
   clientContext.roomUid = command.roomUid;
 
+  std::scoped_lock lock(_raceInstancesMutex);
   // Try to emplace the room instance.
   const auto& [raceInstanceIter, inserted] = _raceInstances.try_emplace(
     command.roomUid);
+
   auto& raceInstance = raceInstanceIter->second;
+  raceInstance.roomUid = command.roomUid;
 
   // If the room instance was just created, set it up.
   if (inserted)
@@ -1029,10 +1064,7 @@ void RaceDirector::HandleEnterRoom(
       });
   }
 
-  {
-    std::scoped_lock lock(raceInstance.clientsMutex);
-    raceInstance.clients.insert(clientId);
-  }
+  raceInstance.clients.insert(clientId);
 }
 
 void RaceDirector::HandleChangeRoomOptions(
@@ -1138,8 +1170,9 @@ void RaceDirector::HandleChangeTeam(
       }
     });
 
+  std::scoped_lock lock(_raceInstancesMutex);
   const auto& raceInstance = GetRaceInstance(clientContext, false);
-  if (raceInstance.stage != RaceDirector::RaceInstance::Stage::Waiting)
+  if (raceInstance.stage != RaceInstance::Stage::Waiting)
   {
     // A racer tried to change teams when not in the waiting room
     // No response needed, client does not change until it receives an OK
@@ -1185,6 +1218,7 @@ void RaceDirector::HandleLeaveRoom(ClientId clientId)
   if (clientContext.roomUid == 0)
     return;
 
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext, false);
 
   _serverInstance.GetDataDirector().GetCharacter(clientContext.characterUid).Immutable(
@@ -1217,10 +1251,7 @@ void RaceDirector::HandleLeaveRoom(ClientId clientId)
     }
   }
 
-  {
-    std::scoped_lock lock(raceInstance.clientsMutex);
-    raceInstance.clients.erase(clientId);
-  }
+  raceInstance.clients.erase(clientId);
 
   _serverInstance.GetRoomSystem().GetRoom(
     clientContext.roomUid,
@@ -1341,6 +1372,7 @@ void RaceDirector::HandleReadyRace(
     .characterUid = clientContext.characterUid,
     .isReady = isPlayerReady};
 
+  std::scoped_lock lock(_raceInstancesMutex);
   const auto& raceInstance = GetRaceInstance(clientContext, false);
   for (const ClientId& raceClientId : raceInstance.clients)
   {
@@ -1353,10 +1385,8 @@ void RaceDirector::HandleReadyRace(
   }
 }
 
-void RaceDirector::PrepareItemSpawners(data::Uid roomUid)
+void RaceDirector::PrepareItemSpawners(RaceInstance& raceInstance)
 {
-  auto& raceInstance = _raceInstances[roomUid];
-
   try {
     const auto& gameModeInfo = GetServerInstance().GetCourseRegistry().GetCourseGameModeInfo(
       static_cast<uint32_t>(raceInstance.raceGameMode));
@@ -1394,7 +1424,7 @@ void RaceDirector::PrepareItemSpawners(data::Uid roomUid)
 
   }
   catch (const std::exception& e) {
-    spdlog::warn("Failed to prepare item spawners for room {}: {}", roomUid, e.what());
+    spdlog::warn("Failed to prepare item spawners for room {}: {}", raceInstance.roomUid, e.what());
   }
 }
 
@@ -1403,6 +1433,8 @@ void RaceDirector::HandleStartRace(
   [[maybe_unused]] const protocol::AcCmdCRStartRace& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext, false);
 
   if (clientContext.characterUid != raceInstance.masterUid)
@@ -1557,7 +1589,7 @@ void RaceDirector::HandleStartRace(
   raceInstance.tracker.Clear();
 
   // Add the items.
-  PrepareItemSpawners(roomUid);
+  PrepareItemSpawners(raceInstance);
 
   // Add the racers.
   _serverInstance.GetRoomSystem().GetRoom(
@@ -1598,6 +1630,7 @@ void RaceDirector::HandleStartRace(
   _scheduler.Queue(
     [this, clientContext]()
     {
+      std::scoped_lock raceInstanceLock(_raceInstancesMutex);
       // Get race instance (and check if added as racer)
       auto& raceInstance = GetRaceInstance(clientContext);
 
@@ -1643,7 +1676,6 @@ void RaceDirector::HandleStartRace(
         || notify.raceGameMode == protocol::GameMode::Magic)
         && notify.raceTeamMode == protocol::TeamMode::FFA;
 
-      std::scoped_lock lock(raceInstance.clientsMutex);
       // Send to all clients participating in the race.
       for (const ClientId& raceClientId : raceInstance.clients)
       {
@@ -1757,6 +1789,7 @@ void RaceDirector::HandleLoadingComplete(
   const protocol::AcCmdCRLoadingComplete&)
 {
   auto& clientContext = GetClientContext(clientId);
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   auto& racer = raceInstance.tracker.GetRacer(
@@ -1807,6 +1840,7 @@ void RaceDirector::HandleUserRaceFinal(
     command.member3);
 
   auto& clientContext = GetClientContext(clientId);
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   // todo: sanity check for course time
@@ -1875,6 +1909,8 @@ void RaceDirector::HandleP2PRaceResult(
   const protocol::AcCmdCRP2PResult&)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   protocol::AcCmdGameRaceP2PResult result{};
@@ -1898,6 +1934,8 @@ void RaceDirector::HandleAwardStart(
   const protocol::AcCmdCRAwardStart& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   protocol::AcCmdRCAwardNotify notify{
@@ -1972,6 +2010,8 @@ void RaceDirector::HandleStarPointGet(
   const protocol::AcCmdCRStarPointGet& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   auto& racer = raceInstance.tracker.GetRacer(
@@ -2017,6 +2057,8 @@ void RaceDirector::HandleRequestSpur(
   const protocol::AcCmdCRRequestSpur& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   auto& racer = raceInstance.tracker.GetRacer(
@@ -2069,6 +2111,8 @@ void RaceDirector::HandleHurdleClearResult(
   const protocol::AcCmdCRHurdleClearResult& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   auto& racer = raceInstance.tracker.GetRacer(
@@ -2205,6 +2249,8 @@ void RaceDirector::HandleStartingRate(
   }
 
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   auto& racer = raceInstance.tracker.GetRacer(
@@ -2245,6 +2291,8 @@ void RaceDirector::HandleRaceUserPos(
   const protocol::AcCmdUserRaceUpdatePos& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
   auto& racer = raceInstance.tracker.GetRacer(clientContext.characterUid);
 
@@ -2426,6 +2474,7 @@ void RaceDirector::HandleChat(ClientId clientId, const protocol::AcCmdCRChat& co
   }
   else
   {
+    std::scoped_lock lock(_raceInstancesMutex);
     // Don't check racer since chat can be sent either
     // in the waiting room or during a race.
     const auto& raceInstance = GetRaceInstance(clientContext, false);
@@ -2453,6 +2502,7 @@ void RaceDirector::HandleRelayCommand(
     .member1 = command.member1,
     .member2 = command.member2};
 
+  std::scoped_lock lock(_raceInstancesMutex);
   // Get the room instance for this client
   const auto& raceInstance = GetRaceInstance(clientContext);
 
@@ -2481,6 +2531,7 @@ void RaceDirector::HandleRelay(
     .member3 = command.member3,
     .data = std::move(command.data),};
 
+  std::scoped_lock lock(_raceInstancesMutex);
   // Get the room instance for this client
   const auto& raceInstance = GetRaceInstance(clientContext);
 
@@ -2496,12 +2547,13 @@ void RaceDirector::HandleRelay(
   }
 }
 
-void RaceDirector::HandleUserRaceActivateInteractiveEvent
-(
+void RaceDirector::HandleUserRaceActivateInteractiveEvent(
   ClientId clientId,
   const protocol::AcCmdUserRaceActivateInteractiveEvent& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   // Get the sender's OID from the room tracker
@@ -2528,6 +2580,8 @@ void RaceDirector::HandleUserRaceActivateEvent
   const protocol::AcCmdUserRaceActivateEvent& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   // Get the sender's OID from the room tracker
@@ -2553,6 +2607,8 @@ void RaceDirector::HandleUserRaceDeactivateEvent
   const protocol::AcCmdUserRaceDeactivateEvent& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   // Get the sender's OID from the room tracker
@@ -2577,6 +2633,8 @@ void RaceDirector::HandleRequestMagicItem(
   const protocol::AcCmdCRRequestMagicItem& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
   auto& racer = raceInstance.tracker.GetRacer(clientContext.characterUid);
 
@@ -2645,6 +2703,8 @@ void RaceDirector::HandleUseMagicItem(
   const protocol::AcCmdCRUseMagicItem& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
   auto& racer = raceInstance.tracker.GetRacer(clientContext.characterUid);
 
@@ -2842,6 +2902,8 @@ void RaceDirector::HandleUserRaceItemGet(
   const protocol::AcCmdUserRaceItemGet& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
   auto& item = raceInstance.tracker.GetItems().at(command.itemId);
 
@@ -3002,6 +3064,8 @@ void RaceDirector::HandleStartMagicTarget(
   const protocol::AcCmdCRStartMagicTarget& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
   auto& racer = raceInstance.tracker.GetRacer(clientContext.characterUid);
 
@@ -3018,6 +3082,8 @@ void RaceDirector::HandleChangeMagicTarget(
   const protocol::AcCmdCRChangeMagicTarget& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
   auto& racer = raceInstance.tracker.GetRacer(clientContext.characterUid);
 
@@ -3060,6 +3126,8 @@ void RaceDirector::HandleActivateSkillEffect(
   const protocol::AcCmdCRActivateSkillEffect& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   auto& targetRacer = raceInstance.tracker.GetRacer(clientContext.characterUid);
@@ -3180,7 +3248,12 @@ void RaceDirector::HandleChangeSkillCardPresetId(
   // No response command
 }
 
-void RaceDirector::ScheduleSkillEffect(RaceDirector::RaceInstance& raceInstance, tracker::Oid attackerOid, tracker::Oid targetOid, const server::registry::Magic::SlotInfo& magicSlotInfo, std::optional<std::function<void()>> afterEffectRemoved){
+void RaceDirector::ScheduleSkillEffect(
+  RaceInstance& raceInstance,
+  tracker::Oid attackerOid, tracker::Oid targetOid,
+  const registry::Magic::SlotInfo& magicSlotInfo,
+  std::optional<std::function<void()>> afterEffectRemoved)
+{
   // Broadcast skill effect activation to all clients in the room
   // TODO: Verify if characterOid and targetOid should be the same once we have NPCs
   protocol::AcCmdRCAddSkillEffect addSkillEffect{
@@ -3209,8 +3282,15 @@ void RaceDirector::ScheduleSkillEffect(RaceDirector::RaceInstance& raceInstance,
   // TODO: Handle overlapping effects of the same type
   uint32_t effectId = magicSlotInfo.skillEffectId;
   _scheduler.Queue(
-    [this, attackerOid, targetOid, effectId, &raceInstance, afterEffectRemoved]()
+    [this, roomUid = raceInstance.roomUid, attackerOid, targetOid, effectId, afterEffectRemoved]()
     {
+      std::scoped_lock raceInstanceLock(_raceInstancesMutex);
+      const auto raceInstanceIter = _raceInstances.find(roomUid);
+      if (raceInstanceIter == _raceInstances.cend())
+        return;
+
+      auto& raceInstance = raceInstanceIter->second;
+
       // Broadcast skill effect deactivation to all clients in the room
       protocol::AcCmdRCRemoveSkillEffect removeSkillEffect{
         .characterOid = targetOid,
@@ -3219,7 +3299,6 @@ void RaceDirector::ScheduleSkillEffect(RaceDirector::RaceInstance& raceInstance,
         .unk1 = 0,
       };
 
-      std::scoped_lock lock(raceInstance.clientsMutex);
       // Broadcast
       for (const ClientId& raceClientId : raceInstance.clients)
       {
@@ -3296,11 +3375,85 @@ void RaceDirector::HandleInviteUser(
   _commandServer.QueueCommand<decltype(response)>(clientId, [response](){ return response; });
 }
 
+void RaceDirector::HandleRequestUser(
+  ClientId clientId,
+  const protocol::AcCmdCRRequestUser& command)
+{
+  const auto& clientContext = GetClientContext(clientId);
+
+  const auto& invokerCharacterUid = clientContext.characterUid;
+
+  const auto invokerRecord = _serverInstance.GetDataDirector().GetCharacter(invokerCharacterUid);
+  if (not invokerRecord)
+    return;
+
+  bool isAdmin = false;
+  std::string invokerCharacterName{};
+  invokerRecord.Immutable([&isAdmin, &invokerCharacterName](const data::Character& character)
+    {
+
+      isAdmin = character.role() != data::Character::Role::User;
+      invokerCharacterName = character.name();
+    });
+  const auto userName = _serverInstance.GetLobbyDirector().GetUserByCharacterUid(
+    clientContext.characterUid).userName;
+
+  if (not isAdmin)
+  {    
+    spdlog::warn("User '{}'('{}'), which is not an admin, tried to summon character '{}'",
+      userName,
+      invokerCharacterName,
+      command.characterName);
+    return;
+  }
+
+  protocol::AcCmdCRRequestUserCancel cancel{};
+  cancel.force= command.force;
+  cancel.characterName = command.characterName;
+  cancel.roomUid = command.roomUid;
+  cancel.ranchUid = command.ranchUid;
+
+  const data::Uid characterUid = GetServerInstance()
+    .GetDataDirector()
+    .GetDataSource()
+    .RetrieveCharacterUidByName(command.characterName);
+
+  if (characterUid == data::InvalidUid)
+  {
+    _commandServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+    return;
+  }
+
+  try
+  {
+    const auto clientOpt = GetServerInstance()
+      .GetLobbyDirector().GetUserByCharacterUid(characterUid);
+  }
+  catch (const std::exception&)
+  {
+    _commandServer.QueueCommand<decltype(cancel)>(clientId, [cancel](){ return cancel; });
+    return;
+  }
+
+  GetServerInstance().GetRaceDirector().NotifyRequestUser(characterUid, command.force, command.characterName, command.roomUid, command.ranchUid);
+  GetServerInstance().GetRanchDirector().NotifyRequestUser(characterUid, command.force, command.characterName, command.roomUid, command.ranchUid);
+
+  protocol::AcCmdCRRequestUserOK response{};
+  response.force= command.force;
+  response.characterName = command.characterName;
+  response.roomUid = command.roomUid;
+  response.ranchUid = command.ranchUid;
+
+  _commandServer.QueueCommand<decltype(response)>(clientId, [response](){ return response; });
+}
+
 void RaceDirector::HandleKickUser(
   ClientId clientId,
   const protocol::AcCmdCRKick& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::unique_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext, false);
 
   // Only the room master may kick players.
@@ -3394,6 +3547,7 @@ void RaceDirector::HandleKickUser(
       });
   }
 
+  lock.unlock();
   HandleLeaveRoom(targetClientId);
 }
 
@@ -3402,6 +3556,8 @@ void RaceDirector::HandleKickUser(
 void RaceDirector::HandleTeamGauge(const ClientId clientId)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   // If race teammode is not team then we are done here.
@@ -3543,8 +3699,15 @@ void RaceDirector::HandleTeamGauge(const ClientId clientId)
     constexpr auto SpurStartDelay = std::chrono::milliseconds(1500);
 
     _scheduler.Queue(
-      [this, &raceInstance, &racer, &spurringTeamInfo, maxPoints, teamSize]()
+      [this, roomUid = raceInstance.roomUid, &racer, &spurringTeamInfo, maxPoints, teamSize]()
       {
+        std::scoped_lock lock(_raceInstancesMutex);
+        const auto raceInstanceIter = _raceInstances.find(roomUid);;
+        if (raceInstanceIter == _raceInstances.cend())
+          return;
+
+        const auto& raceInstance = raceInstanceIter->second;
+
         const float BaseLoseTeamSpurConsumeRate = -10.0f;
         const float BaseWinTeamSpurConsumeRate = -2.5f;
 
@@ -3587,7 +3750,6 @@ void RaceDirector::HandleTeamGauge(const ClientId clientId)
           Scheduler::Clock::now() + std::chrono::milliseconds(
             static_cast<int64_t>(spurDurationSeconds * 1000)));
 
-        std::scoped_lock lock(raceInstance.clientsMutex);
         for (const ClientId& raceClientId : raceInstance.clients)
         {
           // Broadcast losing team's gauge status
@@ -3611,7 +3773,6 @@ void RaceDirector::HandleTeamGauge(const ClientId clientId)
   }
 
   // Broadcast invoker's team gauge status
-  std::scoped_lock lock(raceInstance.clientsMutex);
   for (const auto& raceClientId : raceInstance.clients)
   {
     _commandServer.QueueCommand<decltype(spur)>(raceClientId, [spur](){ return spur; });
@@ -3623,6 +3784,8 @@ void RaceDirector::HandleTriggerizeAct(
   const protocol::AcCmdCRTriggerizeAct& command)
 {
   const auto& clientContext = GetClientContext(clientId);
+
+  std::scoped_lock lock(_raceInstancesMutex);
   auto& raceInstance = GetRaceInstance(clientContext);
 
   const bool isSpeedGameMode = raceInstance.raceGameMode == protocol::GameMode::Speed;
@@ -3645,16 +3808,13 @@ void RaceDirector::HandleTriggerizeAct(
     .unk1 = command.unk1,
     .unk2 = command.unk2};
 
+  for (const auto& raceClientId : raceInstance.clients)
   {
-    std::scoped_lock lock(raceInstance.clientsMutex);
-    for (const auto& raceClientId : raceInstance.clients)
-    {
-      // Do not broadcast to self
-      if (raceClientId == clientId)
-        continue;
+    // Do not broadcast to self
+    if (raceClientId == clientId)
+      continue;
 
-      _commandServer.QueueCommand<decltype(response)>(raceClientId, [response](){ return response; });
-    }
+    _commandServer.QueueCommand<decltype(response)>(raceClientId, [response](){ return response; });
   }
 }
 

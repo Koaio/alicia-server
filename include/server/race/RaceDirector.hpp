@@ -26,6 +26,7 @@
 
 #include "libserver/registry/MagicRegistry.hpp"
 #include "libserver/network/command/CommandServer.hpp"
+#include "libserver/network/command/proto/CommonMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RaceMessageDefinitions.hpp"
 #include "libserver/network/command/proto/RanchMessageDefinitions.hpp"
 #include "libserver/util/Scheduler.hpp"
@@ -57,6 +58,7 @@ public:
 
   bool IsRoomRacing(uint32_t uid)
   {
+    std::scoped_lock lock(_raceInstancesMutex);
     const auto roomIter = _raceInstances.find(uid);
     if (roomIter == _raceInstances.cend())
       return false;
@@ -67,6 +69,7 @@ public:
 
   size_t GetRoomPlayerCount(uint32_t uid)
   {
+    std::scoped_lock lock(_raceInstancesMutex);
     const auto roomIter = _raceInstances.find(uid);
     if (roomIter == _raceInstances.cend())
       return 0;
@@ -77,6 +80,14 @@ public:
   void BroadcastChangeRoomOptions(
     const data::Uid& roomUid,
     const protocol::AcCmdCRChangeRoomOptionsNotify notify);
+
+  //! Send a RequestUser notification to a character connected to this director.
+  void NotifyRequestUser(
+    data::Uid characterUid,
+    bool force,
+    std::string characterName,
+    uint32_t roomUid,
+    uint32_t ranchUid) noexcept;
 
   void HandleClientConnected(ClientId clientId) override;
   void HandleClientDisconnected(ClientId clientId) override;
@@ -109,6 +120,8 @@ private:
     //! A time point of when the stage timeout occurs.
     std::chrono::steady_clock::time_point stageTimeoutTimePoint;
 
+    uint32_t roomUid{};
+
     //! A master's character UID.
     data::Uid masterUid{data::InvalidUid};
     //! A race object tracker.
@@ -125,8 +138,6 @@ private:
 
     //! A time point of when the race is actually started (a countdown is finished).
     std::chrono::steady_clock::time_point raceStartTimePoint;
-    //! A mutex of room clients.
-    std::mutex clientsMutex;
     //! A room clients.
     std::unordered_set<ClientId> clients;
   };
@@ -135,7 +146,7 @@ private:
   ClientId GetClientIdByCharacterUid(data::Uid characterUid);
   ClientContext& GetClientContextByCharacterUid(data::Uid characterUid);
   RaceInstance& GetRaceInstance(
-    const RaceDirector::ClientContext clientContext,
+    const RaceDirector::ClientContext& clientContext,
     const bool checkRacer = true);
   void ScheduleSkillEffect(server::RaceDirector::RaceInstance& raceInstance, server::tracker::Oid attackerId, server::tracker::Oid targetId, const server::registry::Magic::SlotInfo& magicSlotInfo, std::optional<std::function<void()>> afterEffectRemoved = std::nullopt);
 
@@ -281,6 +292,10 @@ private:
     ClientId clientId,
     const protocol::AcCmdCRInviteUser& command);
 
+  void HandleRequestUser(
+    ClientId clientId,
+    const protocol::AcCmdCRRequestUser& command);
+
   void HandleKickUser(
     ClientId clientId,
     const protocol::AcCmdCRKick& command);
@@ -292,7 +307,7 @@ private:
     ClientId clientId,
     const protocol::AcCmdCRTriggerizeAct& command);
 
-  void PrepareItemSpawners(data::Uid roomUid);
+  void PrepareItemSpawners(RaceInstance& raceInstance);
 
   //!
   std::thread test;
@@ -306,6 +321,8 @@ private:
   CommandServer _commandServer;
   //! A map of all client contexts.
   std::unordered_map<ClientId, ClientContext> _clients;
+
+  std::mutex _raceInstancesMutex;
   //! A map of all race instanced indexed by room UIDs.
   std::unordered_map<uint32_t, RaceInstance> _raceInstances;
 };
